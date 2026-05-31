@@ -10,6 +10,7 @@ import {
   Film,
   Server,
   Square,
+  Terminal,
   Video,
   X,
   Wifi,
@@ -69,6 +70,15 @@ interface LogEntry {
   mode: 'stream' | 'record';
 }
 
+// Debug log entry type
+interface DebugLog {
+  id: number;
+  timestamp: string;
+  type: 'info' | 'error' | 'success' | 'warning';
+  message: string;
+  data?: unknown;
+}
+
 export default function App() {
   // State
   const [mode, setMode] = useState<'idle' | 'stream' | 'recording'>('idle');
@@ -80,6 +90,14 @@ export default function App() {
   const [apiStatus, setApiStatus] = useState<'connected' | 'disconnected' | 'checking'>('checking');
   const [showReportModal, setShowReportModal] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [debugLogs, setDebugLogs] = useState<DebugLog[]>([]);
+  const [showDebugPanel, setShowDebugPanel] = useState(true);
+  const [frameStats, setFrameStats] = useState({
+    totalFrames: 0,
+    capturedFrames: 0,
+    lastCaptureTime: '',
+    framesInBuffer: 0
+  });
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -102,6 +120,18 @@ export default function App() {
     modeRef.current = mode;
   }, [mode]);
 
+  // Debug logging function
+  const addDebugLog = useCallback((type: DebugLog['type'], message: string, data?: unknown) => {
+    const log: DebugLog = {
+      id: Date.now(),
+      timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }) + '.' + String(Date.now()).slice(-3),
+      type,
+      message,
+      data
+    };
+    setDebugLogs(prev => [log, ...prev].slice(0, 100));
+  }, []);
+
   // Check API health on mount
   useEffect(() => {
     checkApiHealth();
@@ -111,11 +141,14 @@ export default function App() {
 
   const checkApiHealth = async () => {
     try {
+      addDebugLog('info', 'Checking API health...');
       const response = await fetch(`${API_BASE_URL}/health`);
       const data = await response.json();
       setApiStatus(data.status === 'healthy' ? 'connected' : 'disconnected');
-    } catch {
+      addDebugLog('success', 'API connected', data);
+    } catch (err) {
       setApiStatus('disconnected');
+      addDebugLog('error', 'API connection failed', String(err));
     }
   };
 
@@ -158,31 +191,43 @@ export default function App() {
 
   // Capture frame from video
   const captureFrame = useCallback((): string | null => {
-    if (!videoRef.current || !canvasRef.current) return null;
+    if (!videoRef.current || !canvasRef.current) {
+      return null;
+    }
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
 
-    if (!ctx || video.videoWidth === 0 || video.videoHeight === 0) return null;
+    if (!ctx || video.videoWidth === 0 || video.videoHeight === 0) {
+      return null;
+    }
 
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     ctx.drawImage(video, 0, 0);
 
-    return canvas.toDataURL('image/jpeg', JPEG_QUALITY / 100).split(',')[1];
+    const dataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY / 100);
+    const base64 = dataUrl.split(',')[1];
+
+    return base64;
   }, []);
 
   // Send frames to API for classification
   const sendFramesForClassification = async (frames: string[]) => {
-    if (frames.length < NUM_FRAMES_PER_INFERENCE) return;
+    if (frames.length < NUM_FRAMES_PER_INFERENCE) {
+      addDebugLog('warning', `Not enough frames: ${frames.length}/${NUM_FRAMES_PER_INFERENCE}`);
+      return;
+    }
 
     setIsProcessing(true);
     isProcessingRef.current = true;
+    addDebugLog('info', `Sending ${frames.length} frames for classification...`);
 
     try {
       // Take only the required number of frames
       const framesToSend = frames.slice(0, NUM_FRAMES_PER_INFERENCE);
+      addDebugLog('info', `Frame sizes: ${framesToSend.map(f => f.length).join(', ')} chars`);
 
       const response = await fetch(`${API_BASE_URL}/api/classify-frames`, {
         method: 'POST',
@@ -190,15 +235,21 @@ export default function App() {
         body: JSON.stringify({ frames: framesToSend })
       });
 
+      addDebugLog('info', `Response status: ${response.status} ${response.statusText}`);
+
       if (!response.ok) {
-        throw new Error('API request failed');
+        const errorText = await response.text();
+        addDebugLog('error', `API error response: ${errorText}`);
+        throw new Error(`API request failed: ${response.status} - ${errorText}`);
       }
 
       const data = await response.json();
+      addDebugLog('success', `Classification result: ${data.classification}`, data);
       handleClassificationResult(data.classification, data.timestamp, 'stream');
 
     } catch (error) {
-      console.error('Classification error:', error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      addDebugLog('error', `Classification failed: ${errorMsg}`);
       showToast('Classification failed - retrying...');
     } finally {
       setIsProcessing(false);
@@ -222,21 +273,33 @@ export default function App() {
       if (frame) {
         capturedFramesRef.current.push(frame);
 
+        // Update frame stats
+        setFrameStats({
+          totalFrames: frameCountRef.current,
+          capturedFrames: Math.floor(frameCountRef.current / FRAME_SKIP),
+          lastCaptureTime: new Date().toLocaleTimeString('en-US', { hour12: false }),
+          framesInBuffer: capturedFramesRef.current.length
+        });
+
         // When we have enough frames, send for classification
         if (capturedFramesRef.current.length >= NUM_FRAMES_PER_INFERENCE && !isProcessingRef.current) {
           const framesToProcess = [...capturedFramesRef.current];
           capturedFramesRef.current = [];
+          addDebugLog('info', `Captured ${framesToProcess.length} frames, sending to API...`);
           sendFramesForClassification(framesToProcess);
         }
+      } else {
+        addDebugLog('warning', `Frame capture failed at frame ${frameCountRef.current}`);
       }
     }
 
     // Continue the loop
     animationFrameRef.current = requestAnimationFrame(frameCaptureLoop);
-  }, [captureFrame]);
+  }, [captureFrame, addDebugLog]);
 
   // Start stream mode
   const startStreamMode = async () => {
+    addDebugLog('info', 'Starting stream mode...');
     await startWebcam();
 
     // Reset frame tracking
@@ -250,12 +313,14 @@ export default function App() {
     // Wait for video to be ready
     await new Promise(resolve => setTimeout(resolve, 300));
 
+    addDebugLog('success', 'Stream mode started, beginning frame capture');
     // Start frame capture loop
     animationFrameRef.current = requestAnimationFrame(frameCaptureLoop);
   };
 
   // Stop stream mode
   const stopStreamMode = () => {
+    addDebugLog('info', 'Stopping stream mode...');
     // Stop frame capture loop
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -271,11 +336,13 @@ export default function App() {
     // Clear captured frames
     capturedFramesRef.current = [];
     frameCountRef.current = 0;
+    addDebugLog('info', 'Stream mode stopped');
   };
 
   // Start webcam
   const startWebcam = async () => {
     try {
+      addDebugLog('info', 'Requesting webcam access...');
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, frameRate: 30 },
         audio: false
@@ -284,9 +351,11 @@ export default function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
+        addDebugLog('success', `Webcam started: ${videoRef.current.videoWidth}x${videoRef.current.videoHeight}`);
       }
     } catch (error) {
-      console.error('Error accessing webcam:', error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      addDebugLog('error', `Webcam access failed: ${errorMsg}`);
       showToast('Could not access webcam');
     }
   };
@@ -304,6 +373,7 @@ export default function App() {
 
   // Start recording mode
   const startRecordingMode = async () => {
+    addDebugLog('info', 'Starting recording mode...');
     await startWebcam();
     recordedChunksRef.current = [];
 
@@ -320,6 +390,7 @@ export default function App() {
           mimeType = 'video/webm';
         }
       }
+      addDebugLog('info', `Using mimeType: ${mimeType}`);
 
       const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
 
@@ -334,11 +405,13 @@ export default function App() {
 
       setMode('recording');
       modeRef.current = 'recording';
+      addDebugLog('success', 'Recording started');
     }
   };
 
   // Stop recording mode
   const stopRecordingMode = async () => {
+    addDebugLog('info', 'Stopping recording...');
     const recorder = mediaRecorderRef.current;
 
     if (recorder && recorder.state !== 'inactive') {
@@ -346,6 +419,7 @@ export default function App() {
 
       return new Promise<void>((resolve) => {
         recorder.onstop = async () => {
+          addDebugLog('info', `Recording stopped, ${recordedChunksRef.current.length} chunks`);
           await processRecordedVideo();
           setIsProcessing(false);
           resolve();
@@ -363,11 +437,13 @@ export default function App() {
   const processRecordedVideo = async () => {
     try {
       if (recordedChunksRef.current.length === 0) {
+        addDebugLog('error', 'No video data recorded');
         showToast('No video data recorded');
         return;
       }
 
       const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+      addDebugLog('info', `Video blob size: ${blob.size} bytes`);
 
       // Convert to base64
       const base64Video = await new Promise<string>((resolve, reject) => {
@@ -380,23 +456,31 @@ export default function App() {
         reader.readAsDataURL(blob);
       });
 
+      addDebugLog('info', `Base64 video length: ${base64Video.length} chars`);
+
       // Send to API
+      addDebugLog('info', 'Sending video to API...');
       const response = await fetch(`${API_BASE_URL}/api/classify-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ video: base64Video })
       });
 
+      addDebugLog('info', `Video API response: ${response.status}`);
+
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        addDebugLog('error', `Video API error: ${JSON.stringify(errorData)}`);
         throw new Error(errorData.error || 'API request failed');
       }
 
       const data = await response.json();
+      addDebugLog('success', `Video classification: ${data.classification}`, data);
       handleClassificationResult(data.classification, data.timestamp, 'record');
 
     } catch (error) {
-      console.error('Video classification error:', error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      addDebugLog('error', `Video classification error: ${errorMsg}`);
       showToast('Video classification failed');
     } finally {
       stopWebcam();
@@ -908,6 +992,92 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Debug Panel */}
+      {showDebugPanel && (
+        <div className="fixed bottom-0 left-0 right-0 h-72 bg-[#0a0e1a]/95 border-t border-cyan-500/30 overflow-hidden z-40 backdrop-blur-sm">
+          {/* Debug Header */}
+          <div className="flex items-center justify-between px-4 py-2 border-b border-cyan-500/20 bg-[#0d1225]">
+            <div className="flex items-center gap-3">
+              <Terminal className="w-5 h-5 text-cyan-400" />
+              <h3 className="font-bold text-sm" style={{ fontFamily: 'Orbitron' }}>DEBUG LOGS</h3>
+
+              {/* Frame Stats */}
+              <div className="flex items-center gap-4 ml-4 text-xs text-gray-400">
+                <span>Total: {frameStats.totalFrames}</span>
+                <span>Captured: {frameStats.capturedFrames}</span>
+                <span>Buffer: {frameStats.framesInBuffer}</span>
+                <span>Last: {frameStats.lastCaptureTime || 'N/A'}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setDebugLogs([])}
+                className="px-3 py-1 text-xs bg-red-500/20 border border-red-500/50 rounded hover:bg-red-500/30 text-red-400"
+              >
+                CLEAR
+              </button>
+              <button
+                onClick={() => setShowDebugPanel(false)}
+                className="p-1 hover:bg-gray-700/50 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* Debug Logs */}
+          <div className="h-[calc(100%-44px)] overflow-y-auto p-2 font-mono text-xs">
+            {debugLogs.length === 0 ? (
+              <div className="text-gray-500 text-center py-8">No logs yet. Start streaming to see debug output.</div>
+            ) : (
+              debugLogs.map((log) => (
+                <div
+                  key={log.id}
+                  className={`flex gap-2 py-1 px-2 rounded mb-1 ${
+                    log.type === 'error' ? 'bg-red-500/10 text-red-400' :
+                    log.type === 'warning' ? 'bg-yellow-500/10 text-yellow-400' :
+                    log.type === 'success' ? 'bg-green-500/10 text-green-400' :
+                    'bg-cyan-500/5 text-gray-300'
+                  }`}
+                >
+                  <span className="text-gray-500 flex-shrink-0">{log.timestamp}</span>
+                  <span className={`flex-shrink-0 ${
+                    log.type === 'error' ? 'text-red-500' :
+                    log.type === 'warning' ? 'text-yellow-500' :
+                    log.type === 'success' ? 'text-green-500' :
+                    'text-cyan-400'
+                  }`}>
+                    [{log.type.toUpperCase()}]
+                  </span>
+                  <span className="flex-1">{log.message}</span>
+                  {log.data && (
+                    <span className="text-gray-500 truncate max-w-md">
+                      {typeof log.data === 'object' ? JSON.stringify(log.data) : String(log.data)}
+                    </span>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Debug Toggle Button (when panel is hidden) */}
+      {!showDebugPanel && (
+        <button
+          onClick={() => setShowDebugPanel(true)}
+          className="fixed bottom-4 left-4 px-4 py-2 bg-[#0d1225] border border-cyan-500/50 rounded-lg
+            text-cyan-400 text-sm font-bold hover:bg-cyan-500/10 transition-colors z-50"
+          style={{ fontFamily: 'Orbitron' }}
+        >
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4" />
+            DEBUG
+          </div>
+        </button>
       )}
 
       {/* Toast Notification */}
