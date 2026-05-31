@@ -236,14 +236,25 @@ export default function App() {
       });
 
       addDebugLog('info', `Response status: ${response.status} ${response.statusText}`);
+      addDebugLog('info', `Response headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}`);
+
+      const responseText = await response.text();
+      addDebugLog('info', `Raw response body: ${responseText.substring(0, 500)}${responseText.length > 500 ? '...' : ''}`);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        addDebugLog('error', `API error response: ${errorText}`);
-        throw new Error(`API request failed: ${response.status} - ${errorText}`);
+        addDebugLog('error', `API error response: ${responseText}`);
+        throw new Error(`API request failed: ${response.status} - ${responseText}`);
       }
 
-      const data = await response.json();
+      let data;
+      try {
+        data = JSON.parse(responseText);
+        addDebugLog('success', `Parsed response: ${JSON.stringify(data)}`);
+      } catch (parseError) {
+        addDebugLog('error', `JSON parse error: ${String(parseError)}`);
+        throw new Error(`Failed to parse response: ${responseText}`);
+      }
+
       addDebugLog('success', `Classification result: ${data.classification}`, data);
       handleClassificationResult(data.classification, data.timestamp, 'stream');
 

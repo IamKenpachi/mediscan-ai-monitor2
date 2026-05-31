@@ -133,12 +133,16 @@ def classify_frames_with_gemini(frames):
                    f"Choose EXACTLY ONE from: {', '.join(ACTION_CLASSES)}. "
                    f"Output ONLY the category name.")
 
+    print(f"[GEMINI] Sending {len(frames)} frames for classification...")
+
     # Add each frame
     for i, frame in enumerate(frames):
         # Convert PIL Image to bytes
         buffer = io.BytesIO()
         frame.save(buffer, format='JPEG', quality=JPEG_QUALITY)
         image_bytes = buffer.getvalue()
+
+        print(f"[GEMINI] Frame {i+1}: size={len(image_bytes)} bytes, dimensions={frame.size}")
 
         # Create image part
         content.append({
@@ -147,20 +151,47 @@ def classify_frames_with_gemini(frames):
         })
 
     try:
+        print(f"[GEMINI] Calling API with model: {GEMINI_MODEL_NAME}")
         response = model.generate_content(content)
+
+        print(f"[GEMINI] Raw response type: {type(response)}")
+        print(f"[GEMINI] Raw response: {response}")
+        print(f"[GEMINI] Response text: {response.text}")
+
+        # Check for prompt feedback
+        if hasattr(response, 'prompt_feedback'):
+            print(f"[GEMINI] Prompt feedback: {response.prompt_feedback}")
+
+        # Check for candidates
+        if hasattr(response, 'candidates'):
+            print(f"[GEMINI] Candidates: {response.candidates}")
+            for i, candidate in enumerate(response.candidates):
+                print(f"[GEMINI] Candidate {i}: {candidate}")
+                if hasattr(candidate, 'content'):
+                    print(f"[GEMINI] Candidate content: {candidate.content}")
+                if hasattr(candidate, 'finish_reason'):
+                    print(f"[GEMINI] Finish reason: {candidate.finish_reason}")
+
         classification = response.text.strip().lower()
+        print(f"[GEMINI] Extracted classification (raw): '{classification}'")
 
         # Validate classification is in allowed classes
         # Find closest match from action classes
         for action in ACTION_CLASSES:
             if action in classification or classification in action:
+                print(f"[GEMINI] Matched to action: '{action}'")
                 return action
 
         # Default to first word if no match
-        return classification.split()[0] if classification else 'okay'
+        result = classification.split()[0] if classification else 'okay'
+        print(f"[GEMINI] No match found, using: '{result}'")
+        return result
 
     except Exception as e:
-        print(f"Error calling Gemini API: {str(e)}")
+        print(f"[GEMINI ERROR] Error calling Gemini API: {str(e)}")
+        print(f"[GEMINI ERROR] Exception type: {type(e).__name__}")
+        import traceback
+        print(f"[GEMINI ERROR] Traceback: {traceback.format_exc()}")
         raise
 
 
@@ -246,24 +277,36 @@ def classify_frames():
         }
     """
     try:
+        print("\n" + "="*60)
+        print("[API] /api/classify-frames called")
+        print("="*60)
+
         data = request.get_json()
+        print(f"[API] Request data keys: {list(data.keys()) if data else 'None'}")
 
         if not data or 'frames' not in data:
+            print("[API ERROR] No frames provided in request")
             return jsonify({'error': 'No frames provided'}), 400
 
         raw_frames = data['frames']
+        print(f"[API] Received {len(raw_frames)} frames")
 
         if len(raw_frames) == 0:
+            print("[API ERROR] Empty frames list")
             return jsonify({'error': 'Empty frames list'}), 400
 
         # Process each frame - resize and convert to PIL Image
         frames = []
-        for frame_data in raw_frames:
+        for i, frame_data in enumerate(raw_frames):
+            print(f"[API] Processing frame {i+1}: {len(frame_data)} chars (base64)")
             pil_image = resize_and_encode_frame(frame_data)
+            print(f"[API] Frame {i+1} resized to: {pil_image.size}")
             frames.append(pil_image)
 
         # Call Gemini API
+        print(f"[API] Calling Gemini API with {len(frames)} processed frames...")
         classification = classify_frames_with_gemini(frames)
+        print(f"[API] Gemini returned: '{classification}'")
 
         # Log to session
         timestamp = datetime.now().isoformat()
@@ -273,12 +316,18 @@ def classify_frames():
             'mode': 'stream'
         })
 
+        print(f"[API] Returning response: classification='{classification}', timestamp='{timestamp}'")
+        print("="*60 + "\n")
+
         return jsonify({
             'classification': classification,
             'timestamp': timestamp
         })
 
     except Exception as e:
+        print(f"[API ERROR] Exception in classify_frames: {str(e)}")
+        import traceback
+        print(f"[API ERROR] Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 
