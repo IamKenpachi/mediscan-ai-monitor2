@@ -25,7 +25,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuration variables (exactly as specified)
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 NUM_FRAMES_PER_INFERENCE = 3
 FRAME_SPACING = 15
 API_IMAGE_SIZE = (512, 512)
@@ -133,16 +133,12 @@ def classify_frames_with_gemini(frames):
                    f"Choose EXACTLY ONE from: {', '.join(ACTION_CLASSES)}. "
                    f"Output ONLY the category name.")
 
-    print(f"[GEMINI] Sending {len(frames)} frames for classification...")
-
     # Add each frame
     for i, frame in enumerate(frames):
         # Convert PIL Image to bytes
         buffer = io.BytesIO()
         frame.save(buffer, format='JPEG', quality=JPEG_QUALITY)
         image_bytes = buffer.getvalue()
-
-        print(f"[GEMINI] Frame {i+1}: size={len(image_bytes)} bytes, dimensions={frame.size}")
 
         # Create image part
         content.append({
@@ -151,53 +147,28 @@ def classify_frames_with_gemini(frames):
         })
 
     try:
-        print(f"[GEMINI] Calling API with model: {GEMINI_MODEL_NAME}")
         response = model.generate_content(content)
-
-        print(f"[GEMINI] Raw response type: {type(response)}")
-        print(f"[GEMINI] Raw response: {response}")
-        print(f"[GEMINI] Response text: {response.text}")
-
-        # Check for prompt feedback
-        if hasattr(response, 'prompt_feedback'):
-            print(f"[GEMINI] Prompt feedback: {response.prompt_feedback}")
-
-        # Check for candidates
-        if hasattr(response, 'candidates'):
-            print(f"[GEMINI] Candidates: {response.candidates}")
-            for i, candidate in enumerate(response.candidates):
-                print(f"[GEMINI] Candidate {i}: {candidate}")
-                if hasattr(candidate, 'content'):
-                    print(f"[GEMINI] Candidate content: {candidate.content}")
-                if hasattr(candidate, 'finish_reason'):
-                    print(f"[GEMINI] Finish reason: {candidate.finish_reason}")
-
         classification = response.text.strip().lower()
-        print(f"[GEMINI] Extracted classification (raw): '{classification}'")
 
         # Validate classification is in allowed classes
         # Find closest match from action classes
         for action in ACTION_CLASSES:
             if action in classification or classification in action:
-                print(f"[GEMINI] Matched to action: '{action}'")
                 return action
 
         # Default to first word if no match
-        result = classification.split()[0] if classification else 'okay'
-        print(f"[GEMINI] No match found, using: '{result}'")
-        return result
+        return classification.split()[0] if classification else 'okay'
 
     except Exception as e:
-        print(f"[GEMINI ERROR] Error calling Gemini API: {str(e)}")
-        print(f"[GEMINI ERROR] Exception type: {type(e).__name__}")
-        import traceback
-        print(f"[GEMINI ERROR] Traceback: {traceback.format_exc()}")
+        print(f"Error calling Gemini API: {str(e)}")
         raise
 
 
 def extract_frames_from_video(video_bytes):
     """
     Extract evenly spaced frames from video using OpenCV.
+    Reads all frames sequentially first (required for WebM containers
+    where frame count and seeking are unreliable).
 
     Args:
         video_bytes: Raw video data
@@ -206,21 +177,43 @@ def extract_frames_from_video(video_bytes):
         List of PIL Image objects
     """
     # Write video to temporary file for OpenCV
-    temp_path = '/tmp/temp_video.mp4'
+    temp_path = '/tmp/temp_video.webm'
     with open(temp_path, 'wb') as f:
         f.write(video_bytes)
+    print(f"[RECORD] Wrote {len(video_bytes)} bytes to {temp_path}")
 
     # Open video file
     cap = cv2.VideoCapture(temp_path)
 
     if not cap.isOpened():
+        print(f"[RECORD] ERROR: OpenCV could not open {temp_path}")
         raise ValueError("Could not open video file")
 
-    # Get video properties
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"[RECORD] Video FPS: {fps}")
 
-    # Calculate frame indices for evenly spaced extraction
+    # Read ALL frames sequentially (WebM doesn't support reliable frame count/seeking)
+    all_frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        all_frames.append(frame)
+
+    cap.release()
+    total_frames = len(all_frames)
+    print(f"[RECORD] Read {total_frames} frames from video")
+
+    if total_frames == 0:
+        print("[RECORD] ERROR: No frames could be read from video")
+        # Clean up temp file
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return []
+
+    # Pick evenly spaced frame indices
     if total_frames <= NUM_FRAMES_PER_INFERENCE:
         frame_indices = list(range(total_frames))
     else:
@@ -228,34 +221,33 @@ def extract_frames_from_video(video_bytes):
             int(i * total_frames / NUM_FRAMES_PER_INFERENCE)
             for i in range(NUM_FRAMES_PER_INFERENCE)
         ]
+    print(f"[RECORD] Selected frame indices: {frame_indices}")
 
-    # Extract frames at calculated indices
+    # Process selected frames
     frames = []
     for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if ret:
-            # Convert BGR to RGB and create PIL Image
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame_rgb)
+        frame = all_frames[idx]
+        # Convert BGR to RGB and create PIL Image
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
 
-            # Resize to target size
-            pil_image.thumbnail(API_IMAGE_SIZE, Image.Resampling.LANCZOS)
+        # Resize to target size
+        pil_image.thumbnail(API_IMAGE_SIZE, Image.Resampling.LANCZOS)
 
-            # Pad to exact size
-            new_image = Image.new('RGB', API_IMAGE_SIZE, (0, 0, 0))
-            paste_x = (API_IMAGE_SIZE[0] - pil_image.width) // 2
-            paste_y = (API_IMAGE_SIZE[1] - pil_image.height) // 2
-            new_image.paste(pil_image, (paste_x, paste_y))
+        # Pad to exact size
+        new_image = Image.new('RGB', API_IMAGE_SIZE, (0, 0, 0))
+        paste_x = (API_IMAGE_SIZE[0] - pil_image.width) // 2
+        paste_y = (API_IMAGE_SIZE[1] - pil_image.height) // 2
+        new_image.paste(pil_image, (paste_x, paste_y))
 
-            frames.append(new_image)
+        frames.append(new_image)
 
-    cap.release()
+    print(f"[RECORD] Successfully extracted {len(frames)} frames")
 
     # Clean up temp file
     try:
         os.remove(temp_path)
-    except:
+    except OSError:
         pass
 
     return frames
@@ -277,36 +269,24 @@ def classify_frames():
         }
     """
     try:
-        print("\n" + "="*60)
-        print("[API] /api/classify-frames called")
-        print("="*60)
-
         data = request.get_json()
-        print(f"[API] Request data keys: {list(data.keys()) if data else 'None'}")
 
         if not data or 'frames' not in data:
-            print("[API ERROR] No frames provided in request")
             return jsonify({'error': 'No frames provided'}), 400
 
         raw_frames = data['frames']
-        print(f"[API] Received {len(raw_frames)} frames")
 
         if len(raw_frames) == 0:
-            print("[API ERROR] Empty frames list")
             return jsonify({'error': 'Empty frames list'}), 400
 
         # Process each frame - resize and convert to PIL Image
         frames = []
-        for i, frame_data in enumerate(raw_frames):
-            print(f"[API] Processing frame {i+1}: {len(frame_data)} chars (base64)")
+        for frame_data in raw_frames:
             pil_image = resize_and_encode_frame(frame_data)
-            print(f"[API] Frame {i+1} resized to: {pil_image.size}")
             frames.append(pil_image)
 
         # Call Gemini API
-        print(f"[API] Calling Gemini API with {len(frames)} processed frames...")
         classification = classify_frames_with_gemini(frames)
-        print(f"[API] Gemini returned: '{classification}'")
 
         # Log to session
         timestamp = datetime.now().isoformat()
@@ -316,18 +296,12 @@ def classify_frames():
             'mode': 'stream'
         })
 
-        print(f"[API] Returning response: classification='{classification}', timestamp='{timestamp}'")
-        print("="*60 + "\n")
-
         return jsonify({
             'classification': classification,
             'timestamp': timestamp
         })
 
     except Exception as e:
-        print(f"[API ERROR] Exception in classify_frames: {str(e)}")
-        import traceback
-        print(f"[API ERROR] Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -351,21 +325,28 @@ def classify_video():
         data = request.get_json()
 
         if not data or 'video' not in data:
+            print("[RECORD] ERROR: No video data in request body")
             return jsonify({'error': 'No video provided'}), 400
 
         # Decode base64 video
         video_data = data['video']
+        print(f"[RECORD] Received video data, length: {len(video_data)} chars")
 
         # Handle data URL prefix if present
         if ',' in video_data:
+            prefix = video_data.split(',')[0]
+            print(f"[RECORD] Data URL prefix: {prefix}")
             video_data = video_data.split(',')[1]
 
         video_bytes = base64.b64decode(video_data)
+        print(f"[RECORD] Decoded video bytes: {len(video_bytes)} bytes")
 
         # Extract frames from video
         frames = extract_frames_from_video(video_bytes)
+        print(f"[RECORD] Extracted {len(frames)} frames")
 
         if len(frames) == 0:
+            print("[RECORD] ERROR: Zero frames extracted from video")
             return jsonify({'error': 'Could not extract frames from video'}), 400
 
         # Call Gemini API
